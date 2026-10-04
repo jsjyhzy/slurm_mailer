@@ -1,0 +1,28 @@
+[project]
+name = "slurm-mailer"
+version = "0.1.0"
+description = "Slurm job status transient notification program via email"
+readme = "README.md"
+authors = [
+    { name = "Hu Zheyang", email = "jsjyhzy@gmail.com" }
+]
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+slurm-mailer = "slurm_mailer:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[dependency-groups]
+dev = [
+    "flake8>=7.3.0",
+]
+
+
