@@ -1,6 +1,6 @@
 [project]
 name = "slurm-mailer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Slurm job status transient notification program via email"
 readme = "README.md"
 authors = [
@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 slurm-mailer = "slurm_mailer:main"
+slurm-mailer-setup = "slurm_mailer:setup_main"
 
 [build-system]
 requires = ["setuptools>=64"]

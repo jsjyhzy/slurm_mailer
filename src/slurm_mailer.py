@@ -13,6 +13,7 @@ import subprocess
 import smtplib
 import time
 import logging
+import getpass
 import sys
 import os
 from email.mime.text import MIMEText
@@ -115,6 +116,7 @@ class EmailConfig:
     smtp_tls: bool
     from_addr: str
     to_addrs: list[str]
+    smtp_ssl: bool = False
 
 
 @dataclass
@@ -128,6 +130,16 @@ class AppConfig:
     sacct_args: list[str]
 
 
+def _parse_tls_mode(value: str) -> tuple:
+    """Map a tls config value to (starttls, ssl) flags."""
+    mode = (value or "").strip().lower()
+    if mode in ("ssl", "smtps"):
+        return False, True
+    if mode in ("none", "off", "no", "false", "0", "disabled"):
+        return False, False
+    return True, False
+
+
 def parse_config(config_path: str) -> AppConfig:
     cp = configparser.ConfigParser()
     cp.read(config_path)
@@ -136,7 +148,7 @@ def parse_config(config_path: str) -> AppConfig:
     smtp_port = cp.getint("smtp", "port", fallback=587)
     smtp_user = cp.get("smtp", "user", fallback="")
     smtp_password = cp.get("smtp", "password", fallback="")
-    smtp_tls = cp.getboolean("smtp", "tls", fallback=True)
+    smtp_tls, smtp_ssl = _parse_tls_mode(cp.get("smtp", "tls", fallback="starttls"))
     from_addr = cp.get("email", "from", fallback="slurm-mailer@example.com")
     to_addrs = [a.strip() for a in cp.get("email", "to", fallback="").split(",") if a.strip()]
     watch_user = cp.get("slurm", "watch_user", fallback=None)
@@ -169,6 +181,7 @@ def parse_config(config_path: str) -> AppConfig:
             smtp_user=smtp_user,
             smtp_password=smtp_password,
             smtp_tls=smtp_tls,
+            smtp_ssl=smtp_ssl,
             from_addr=from_addr,
             to_addrs=to_addrs,
         ),
@@ -190,7 +203,10 @@ class SlurmMailer:
     ):
         self.config = config
         self.subprocess_fn = subprocess_fn or subprocess.run
-        self.smtp_class = smtp_class or smtplib.SMTP
+        if smtp_class is not None:
+            self.smtp_class = smtp_class
+        else:
+            self.smtp_class = smtplib.SMTP_SSL if config.email.smtp_ssl else smtplib.SMTP
         self.previous_jobs: dict[str, SlurmJob] = {}
         self.pending_changes: dict[str, dict] = {}
         self.last_aggregation = time.time()
@@ -574,12 +590,352 @@ class SlurmMailer:
                 sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Setup wizard (slurm-mailer-setup)
+# ---------------------------------------------------------------------------
+
+TLS_MODES = [
+    ("starttls", "StartTLS upgrade on the given port (recommended, port 587)"),
+    ("ssl", "Implicit TLS from the start (port 465)"),
+    ("none", "No encryption (trusted local relay only)"),
+]
+
+WATCH_MODES = [
+    ("me", "My jobs only"),
+    ("user", "A specific user's jobs"),
+    ("all", "All jobs visible to me"),
+]
+
+
+def prompt_str(message: str, default: Optional[str] = None, input_fn=input) -> str:
+    suffix = f" [{default}]" if default else ""
+    while True:
+        raw = input_fn(f"{message}{suffix}: ").strip()
+        if raw:
+            return raw
+        if default is not None:
+            return default
+        print("A value is required.")
+
+
+def prompt_bool(message: str, default: bool = True, input_fn=input) -> bool:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        raw = input_fn(f"{message} [{hint}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in ("y", "yes", "true", "1"):
+            return True
+        if raw in ("n", "no", "false", "0"):
+            return False
+        print("Please answer yes or no.")
+
+
+def prompt_int(message: str, default: int, input_fn=input, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
+    while True:
+        raw = input_fn(f"{message} [{default}]: ").strip()
+        if not raw:
+            value = default
+        else:
+            try:
+                value = int(raw)
+            except ValueError:
+                print("Please enter a number.")
+                continue
+        if min_value is not None and value < min_value:
+            print(f"Minimum is {min_value}.")
+            continue
+        if max_value is not None and value > max_value:
+            print(f"Maximum is {max_value}.")
+            continue
+        return value
+
+
+def prompt_choice(message: str, options: list, default_key: Optional[str] = None, input_fn=input) -> str:
+    print(f"{message}:")
+    keys = []
+    for i, (key, label) in enumerate(options, 1):
+        keys.append(key)
+        marker = " (default)" if key == default_key else ""
+        print(f"  {i}. {label}{marker}")
+    valid_numbers = {str(i) for i in range(1, len(options) + 1)}
+    while True:
+        suffix = f" [{default_key}]" if default_key else ""
+        raw = input_fn(f"Choice{suffix}: ").strip().lower()
+        if not raw and default_key:
+            return default_key
+        if raw in valid_numbers:
+            return options[int(raw) - 1][0]
+        if raw in keys:
+            return raw
+        print("Invalid choice.")
+
+
+def prompt_password(message: str, getpass_fn=None) -> str:
+    fn = getpass_fn or getpass.getpass
+    return fn(f"{message}: ").strip()
+
+
+@dataclass
+class WizardAnswers:
+    smtp_host: str
+    smtp_port: int
+    smtp_tls_mode: str
+    smtp_user: str
+    smtp_password: str
+    from_addr: str
+    to_addrs: list[str]
+    watch_user: str
+    watch_all_users: bool
+    poll_interval: int
+    aggregation_minutes: int
+
+
+def render_config(answers: WizardAnswers) -> str:
+    return (
+        "# Slurm Mailer configuration\n"
+        "# Generated by slurm-mailer-setup. Do not commit this file;\n"
+        "# it contains your SMTP password.\n"
+        "\n"
+        "[smtp]\n"
+        f"host = {answers.smtp_host}\n"
+        f"port = {answers.smtp_port}\n"
+        f"tls = {answers.smtp_tls_mode}\n"
+        f"user = {answers.smtp_user}\n"
+        f"password = {answers.smtp_password}\n"
+        "\n"
+        "[email]\n"
+        f"from = {answers.from_addr}\n"
+        f"to = {', '.join(answers.to_addrs)}\n"
+        "\n"
+        "[slurm]\n"
+        f"watch_user = {answers.watch_user}\n"
+        f"watch_all_users = {'true' if answers.watch_all_users else 'false'}\n"
+        f"poll_interval_seconds = {answers.poll_interval}\n"
+        f"aggregation_minutes = {answers.aggregation_minutes}\n"
+    )
+
+
+def render_unit(config_path: str, exec_start: str, path_value: str) -> str:
+    return (
+        "[Unit]\n"
+        "Description=Slurm job status notification daemon\n"
+        "After=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"ExecStart={exec_start}\n"
+        f"Environment=SLURM_MAILER_CONFIG={config_path}\n"
+        f"Environment=PATH={path_value}\n"
+        "Restart=on-failure\n"
+        "RestartSec=10\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def resolve_exec_start(which_fn=None) -> str:
+    which = which_fn or shutil.which
+    path = which("slurm-mailer")
+    if path:
+        return path
+    return f"{sys.executable} {os.path.abspath(__file__)}"
+
+
+def write_private(path: str, text: str, overwrite: bool = False) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if not overwrite:
+        flags |= os.O_EXCL
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+    finally:
+        os.chmod(path, 0o600)
+
+
+def send_test_email(email_config: EmailConfig, smtp_class: Optional[Callable] = None) -> Optional[str]:
+    """Send a test message. Return None on success or an error message on failure."""
+    msg = MIMEText(
+        "<p>This is a test message from the <strong>slurm-mailer</strong> setup wizard.</p>",
+        "html",
+    )
+    msg["Subject"] = "slurm-mailer test email"
+    msg["From"] = email_config.from_addr
+    msg["To"] = ", ".join(email_config.to_addrs)
+    cls = smtp_class or (smtplib.SMTP_SSL if email_config.smtp_ssl else smtplib.SMTP)
+    try:
+        with cls(email_config.smtp_host, email_config.smtp_port) as server:
+            if email_config.smtp_tls and hasattr(server, "starttls"):
+                server.starttls()
+            if email_config.smtp_user:
+                server.login(email_config.smtp_user, email_config.smtp_password)
+            server.sendmail(email_config.from_addr, email_config.to_addrs, msg.as_string())
+    except Exception as exc:
+        return str(exc) or exc.__class__.__name__
+    return None
+
+
+def run_setup(
+    input_fn=input,
+    getpass_fn=None,
+    smtp_class=None,
+    env: Optional[dict] = None,
+    which_fn=None,
+    username: Optional[str] = None,
+) -> int:
+    environ = env if env is not None else os.environ
+    which = which_fn or shutil.which
+    home = environ.get("HOME") or os.path.expanduser("~")
+    xdg = environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+
+    print("slurm-mailer setup wizard")
+    print("=" * 60)
+    print("Press Enter to accept the value shown in [brackets].\n")
+
+    print("SMTP server")
+    print("-" * 60)
+    smtp_host = prompt_str("SMTP host", "localhost", input_fn)
+    tls_mode = prompt_choice("Encryption", TLS_MODES, default_key="starttls", input_fn=input_fn)
+    default_port = 465 if tls_mode == "ssl" else 587
+    smtp_port = prompt_int("SMTP port", default_port, input_fn, min_value=1, max_value=65535)
+    smtp_user = prompt_str("SMTP username (empty for none)", "", input_fn)
+    smtp_password = ""
+    if smtp_user:
+        smtp_password = prompt_password("SMTP password (empty for none)", getpass_fn)
+    else:
+        print("No SMTP username given; skipping password.")
+
+    print("\nEmail")
+    print("-" * 60)
+    from_addr = prompt_str("From address", None, input_fn)
+    while True:
+        to_raw = prompt_str("Recipient addresses (comma-separated)", None, input_fn)
+        to_addrs = [a.strip() for a in to_raw.split(",") if a.strip()]
+        if to_addrs and all("@" in a for a in to_addrs):
+            break
+        print("Invalid address list. Example: alice@example.com, bob@example.com")
+
+    email_cfg = EmailConfig(
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_user=smtp_user,
+        smtp_password=smtp_password,
+        smtp_tls=tls_mode == "starttls",
+        smtp_ssl=tls_mode == "ssl",
+        from_addr=from_addr,
+        to_addrs=to_addrs,
+    )
+
+    print()
+    if prompt_bool("Send a test email now?", True, input_fn):
+        while True:
+            error = send_test_email(email_cfg, smtp_class)
+            if error is None:
+                print("Test email sent successfully.")
+                break
+            print(f"Test email failed: {error}")
+            if not prompt_bool("Retry?", True, input_fn):
+                print("Continuing without a verified connection.")
+                break
+
+    print("\nSlurm monitoring")
+    print("-" * 60)
+    mode = prompt_choice("Watch mode", WATCH_MODES, default_key="me", input_fn=input_fn)
+    watch_user = ""
+    watch_all_users = False
+    if mode == "me":
+        watch_user = username if username is not None else getpass.getuser()
+    elif mode == "user":
+        watch_user = prompt_str("Username to watch", None, input_fn)
+    else:
+        watch_all_users = True
+    poll_interval = prompt_int("Poll interval in seconds", 30, input_fn, min_value=1)
+    aggregation_minutes = prompt_int("Aggregation window in minutes", 10, input_fn, min_value=1)
+
+    answers = WizardAnswers(
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_tls_mode=tls_mode,
+        smtp_user=smtp_user,
+        smtp_password=smtp_password,
+        from_addr=from_addr,
+        to_addrs=to_addrs,
+        watch_user=watch_user,
+        watch_all_users=watch_all_users,
+        poll_interval=poll_interval,
+        aggregation_minutes=aggregation_minutes,
+    )
+
+    print("\nFiles")
+    print("-" * 60)
+    default_config = os.path.join(xdg, "slurm-mailer", "config.ini")
+    config_path = os.path.abspath(os.path.expanduser(prompt_str("Configuration file path", default_config, input_fn)))
+    overwrite = False
+    if os.path.exists(config_path):
+        if not prompt_bool(f"{config_path} already exists. Overwrite?", False, input_fn):
+            print("Aborted: existing configuration was not modified.")
+            return 1
+        overwrite = True
+    write_private(config_path, render_config(answers), overwrite=overwrite)
+
+    default_unit = os.path.join(xdg, "systemd", "user", "slurm-mailer.service")
+    unit_path = os.path.abspath(os.path.expanduser(prompt_str("systemd user unit path", default_unit, input_fn)))
+    write_unit = True
+    unit_overwrite = False
+    if os.path.exists(unit_path):
+        if prompt_bool(f"{unit_path} already exists. Overwrite?", False, input_fn):
+            unit_overwrite = True
+        else:
+            print("Skipping systemd unit generation.")
+            write_unit = False
+    if write_unit:
+        unit_text = render_unit(
+            config_path,
+            resolve_exec_start(which),
+            environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        )
+        write_private(unit_path, unit_text, overwrite=unit_overwrite)
+
+    print()
+    print("Setup complete.")
+    print("=" * 60)
+    print(f"Configuration: {config_path} (mode 0600)")
+    if write_unit:
+        print(f"Service unit:   {unit_path}")
+        print()
+        print("Next steps (run these yourself):")
+        print("  systemctl --user daemon-reload")
+        print("  systemctl --user enable --now slurm-mailer.service")
+        print("  journalctl --user -u slurm-mailer -f")
+        print()
+        print("To keep the daemon running after logout:")
+        print("  loginctl enable-linger $USER")
+    else:
+        print("Service unit:   not written")
+        print()
+        print("Run the daemon manually with: slurm-mailer")
+    return 0
+
+
+def setup_main() -> int:
+    try:
+        return run_setup()
+    except (KeyboardInterrupt, EOFError):
+        print("\nAborted.")
+        return 130
+
+
 def main():
     config_path = os.environ.get("SLURM_MAILER_CONFIG", "config.ini")
 
     if not os.path.exists(config_path):
         print(f"Error: Config file not found at {config_path}", file=sys.stderr)
-        print("Set SLURM_MAILER_CONFIG environment variable or create config.ini", file=sys.stderr)
+        print("Run 'slurm-mailer-setup' to create one, or set SLURM_MAILER_CONFIG.", file=sys.stderr)
         sys.exit(1)
 
     config = parse_config(config_path)

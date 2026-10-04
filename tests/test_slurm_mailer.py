@@ -1,6 +1,10 @@
 import unittest
 import sys
 import os
+import io
+import smtplib
+import shutil
+import tempfile
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta
 
@@ -10,6 +14,18 @@ from slurm_mailer import (  # noqa: E402
     parse_config,
     SlurmJob,
     SlurmMailer,
+    prompt_str,
+    prompt_bool,
+    prompt_int,
+    prompt_choice,
+    prompt_password,
+    WizardAnswers,
+    render_config,
+    render_unit,
+    write_private,
+    send_test_email,
+    run_setup,
+    EmailConfig,
 )
 
 
@@ -366,6 +382,319 @@ poll_interval_seconds = 1
             with patch("shutil.which", return_value="/usr/bin/squeue"):
                 mailer.run()
         mock_subprocess.assert_called()
+
+
+def scripted_input(responses):
+    queue = list(responses)
+
+    def _input(prompt=""):
+        if not queue:
+            raise AssertionError(f"Unexpected prompt: {prompt}")
+        return queue.pop(0)
+    return _input
+
+
+def sample_answers(**overrides):
+    base = dict(
+        smtp_host="smtp.example.com",
+        smtp_port=587,
+        smtp_tls_mode="starttls",
+        smtp_user="mailer@example.com",
+        smtp_password="secret",
+        from_addr="from@example.com",
+        to_addrs=["alice@example.com", "bob@example.com"],
+        watch_user="alice",
+        watch_all_users=False,
+        poll_interval=30,
+        aggregation_minutes=10,
+    )
+    base.update(overrides)
+    return WizardAnswers(**base)
+
+
+class FailingSMTP:
+    def __init__(self, *args, **kwargs):
+        raise OSError("connection refused")
+
+
+class TestPrompts(unittest.TestCase):
+    def test_prompt_str_default_on_empty(self):
+        self.assertEqual(prompt_str("Host", "localhost", scripted_input([""])), "localhost")
+        self.assertEqual(prompt_str("Host", "localhost", scripted_input(["mail.example.com"])), "mail.example.com")
+
+    def test_prompt_str_required_reprompt(self):
+        fn = scripted_input(["", "someone@example.com"])
+        self.assertEqual(prompt_str("From address", None, fn), "someone@example.com")
+
+    def test_prompt_bool_reprompt_on_invalid(self):
+        fn = scripted_input(["maybe", "n"])
+        self.assertFalse(prompt_bool("Send test?", True, fn))
+        self.assertTrue(prompt_bool("Send test?", True, scripted_input([""])))
+        self.assertTrue(prompt_bool("Send test?", True, scripted_input(["yes"])))
+
+    def test_prompt_int_reprompt_on_invalid_and_bounds(self):
+        fn = scripted_input(["abc", "0", "42"])
+        self.assertEqual(prompt_int("Port", 587, fn, min_value=1), 42)
+        self.assertEqual(prompt_int("Port", 587, scripted_input([""])), 587)
+        fn = scripted_input(["99999", ""])
+        self.assertEqual(prompt_int("Port", 587, fn, max_value=65535), 587)
+
+    def test_prompt_choice_number_key_and_default(self):
+        options = [("me", "My jobs"), ("user", "Specific user"), ("all", "All jobs")]
+        self.assertEqual(prompt_choice("Watch", options, "me", scripted_input(["2"])), "user")
+        self.assertEqual(prompt_choice("Watch", options, "me", scripted_input(["all"])), "all")
+        self.assertEqual(prompt_choice("Watch", options, "me", scripted_input([""])), "me")
+        fn = scripted_input(["bogus", "3"])
+        self.assertEqual(prompt_choice("Watch", options, "me", fn), "all")
+
+    def test_prompt_password_uses_getpass_fn(self):
+        calls = []
+
+        def fake_getpass(prompt):
+            calls.append(prompt)
+            return "hunter2"
+        self.assertEqual(prompt_password("SMTP password", fake_getpass), "hunter2")
+        self.assertEqual(len(calls), 1)
+
+
+class TestRenderConfig(unittest.TestCase):
+    def test_render_config_roundtrip(self):
+        answers = sample_answers()
+        path = "/tmp/test_render_roundtrip.ini"
+        with open(path, "w") as f:
+            f.write(render_config(answers))
+        try:
+            c = parse_config(path)
+            self.assertEqual(c.email.smtp_host, "smtp.example.com")
+            self.assertEqual(c.email.smtp_port, 587)
+            self.assertTrue(c.email.smtp_tls)
+            self.assertFalse(c.email.smtp_ssl)
+            self.assertEqual(c.email.smtp_user, "mailer@example.com")
+            self.assertEqual(c.email.smtp_password, "secret")
+            self.assertEqual(c.email.from_addr, "from@example.com")
+            self.assertEqual(c.email.to_addrs, ["alice@example.com", "bob@example.com"])
+            self.assertEqual(c.watch_user, "alice")
+            self.assertFalse(c.watch_all_users)
+            self.assertEqual(c.poll_interval, 30)
+            self.assertEqual(c.aggregation_interval, 10)
+        finally:
+            os.remove(path)
+
+    def test_render_config_tls_modes(self):
+        for mode, tls, ssl in (("starttls", True, False), ("ssl", False, True), ("none", False, False)):
+            answers = sample_answers(smtp_tls_mode=mode)
+            path = f"/tmp/test_render_tls_{mode}.ini"
+            with open(path, "w") as f:
+                f.write(render_config(answers))
+            try:
+                c = parse_config(path)
+                self.assertEqual(c.email.smtp_tls, tls, mode)
+                self.assertEqual(c.email.smtp_ssl, ssl, mode)
+            finally:
+                os.remove(path)
+
+    def test_render_config_all_users(self):
+        answers = sample_answers(watch_user="", watch_all_users=True)
+        text = render_config(answers)
+        self.assertIn("watch_user = \n", text)
+        self.assertIn("watch_all_users = true", text)
+
+
+class TestRenderUnit(unittest.TestCase):
+    def test_render_unit_contents(self):
+        text = render_unit("/home/alice/.config/slurm-mailer/config.ini", "/usr/local/bin/slurm-mailer", "/usr/local/bin:/usr/bin")
+        self.assertIn("[Unit]", text)
+        self.assertIn("[Service]", text)
+        self.assertIn("[Install]", text)
+        self.assertIn("ExecStart=/usr/local/bin/slurm-mailer", text)
+        self.assertIn("Environment=SLURM_MAILER_CONFIG=/home/alice/.config/slurm-mailer/config.ini", text)
+        self.assertIn("Environment=PATH=/usr/local/bin:/usr/bin", text)
+        self.assertIn("Restart=on-failure", text)
+        self.assertIn("WantedBy=default.target", text)
+
+
+class TestWritePrivate(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    def test_write_private_creates_with_0600(self):
+        path = os.path.join(self.dir, "sub", "config.ini")
+        write_private(path, "hello")
+        with open(path) as f:
+            self.assertEqual(f.read(), "hello")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_write_private_refuses_overwrite(self):
+        path = os.path.join(self.dir, "config.ini")
+        write_private(path, "original")
+        with self.assertRaises(FileExistsError):
+            write_private(path, "changed", overwrite=False)
+        with open(path) as f:
+            self.assertEqual(f.read(), "original")
+
+    def test_write_private_overwrite(self):
+        path = os.path.join(self.dir, "config.ini")
+        write_private(path, "original")
+        write_private(path, "replaced", overwrite=True)
+        with open(path) as f:
+            self.assertEqual(f.read(), "replaced")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+
+class TestSendTestEmail(unittest.TestCase):
+    def test_success_returns_none(self):
+        cfg = EmailConfig(
+            smtp_host="smtp.example.com", smtp_port=587, smtp_user="u", smtp_password="p",
+            smtp_tls=True, from_addr="from@example.com", to_addrs=["to@example.com"],
+        )
+        self.assertIsNone(send_test_email(cfg, MockSMTP))
+
+    def test_failure_returns_error(self):
+        cfg = EmailConfig(
+            smtp_host="smtp.example.com", smtp_port=587, smtp_user="u", smtp_password="p",
+            smtp_tls=True, from_addr="from@example.com", to_addrs=["to@example.com"],
+        )
+        error = send_test_email(cfg, FailingSMTP)
+        self.assertIn("connection refused", error)
+
+
+class TestParseConfigTlsModes(unittest.TestCase):
+    def _parse_tls(self, value):
+        path = f"/tmp/test_tls_{value.replace(' ', '_')}.ini"
+        with open(path, "w") as f:
+            f.write(f"[smtp]\ntls = {value}\n[email]\n[slurm]\n")
+        try:
+            return parse_config(path)
+        finally:
+            os.remove(path)
+
+    def test_ssl_mode(self):
+        c = self._parse_tls("ssl")
+        self.assertTrue(c.email.smtp_ssl)
+        self.assertFalse(c.email.smtp_tls)
+
+    def test_none_mode(self):
+        c = self._parse_tls("none")
+        self.assertFalse(c.email.smtp_ssl)
+        self.assertFalse(c.email.smtp_tls)
+
+    def test_legacy_true_still_starttls(self):
+        c = self._parse_tls("true")
+        self.assertTrue(c.email.smtp_tls)
+        self.assertFalse(c.email.smtp_ssl)
+
+    def test_legacy_false_still_disabled(self):
+        c = self._parse_tls("false")
+        self.assertFalse(c.email.smtp_tls)
+        self.assertFalse(c.email.smtp_ssl)
+
+    def test_ssl_config_selects_smtp_ssl_class(self):
+        path = "/tmp/test_ssl_class.ini"
+        with open(path, "w") as f:
+            f.write("[smtp]\ntls = ssl\n[email]\n[slurm]\n")
+        try:
+            mailer = SlurmMailer(parse_config(path))
+            self.assertEqual(mailer.smtp_class, smtplib.SMTP_SSL)
+        finally:
+            os.remove(path)
+
+
+class TestRunSetup(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home)
+        self.env = {"HOME": self.home, "PATH": "/usr/bin:/bin"}
+        self.stdout = io.StringIO()
+        self._stdout_patch = patch("sys.stdout", self.stdout)
+        self._stdout_patch.start()
+        self.addCleanup(self._stdout_patch.stop)
+
+    def base_responses(self, extra=()):
+        return [
+            "smtp.example.com",           # SMTP host
+            "",                           # encryption -> starttls
+            "",                           # port -> 587
+            "mailer@example.com",         # SMTP user
+            "from@example.com",           # from address
+            "alice@example.com, bob@example.com",  # recipients
+            "n",                          # send test email? no
+            "",                           # watch mode -> me
+            "",                           # poll interval -> 30
+            "",                           # aggregation -> 10
+            "",                           # config path default
+            "",                           # unit path default
+        ] + list(extra)
+
+    def _run(self, responses, getpass_fn=None, smtp_class=None, username="alice"):
+        return run_setup(
+            input_fn=scripted_input(responses),
+            getpass_fn=getpass_fn or (lambda prompt: "secret"),
+            smtp_class=smtp_class,
+            env=self.env,
+            which_fn=lambda name: "/usr/local/bin/slurm-mailer" if name == "slurm-mailer" else None,
+            username=username,
+        )
+
+    def test_end_to_end_writes_config_and_unit(self):
+        rc = self._run(self.base_responses())
+        self.assertEqual(rc, 0)
+        config_path = os.path.join(self.home, ".config", "slurm-mailer", "config.ini")
+        unit_path = os.path.join(self.home, ".config", "systemd", "user", "slurm-mailer.service")
+        self.assertTrue(os.path.exists(config_path))
+        self.assertTrue(os.path.exists(unit_path))
+        self.assertEqual(os.stat(config_path).st_mode & 0o777, 0o600)
+        c = parse_config(config_path)
+        self.assertEqual(c.email.smtp_host, "smtp.example.com")
+        self.assertEqual(c.email.smtp_password, "secret")
+        self.assertEqual(c.email.to_addrs, ["alice@example.com", "bob@example.com"])
+        self.assertEqual(c.watch_user, "alice")
+        with open(unit_path) as f:
+            unit = f.read()
+        self.assertIn("ExecStart=/usr/local/bin/slurm-mailer", unit)
+        self.assertIn(f"Environment=SLURM_MAILER_CONFIG={config_path}", unit)
+        self.assertIn("Environment=PATH=/usr/bin:/bin", unit)
+
+    def test_aborts_when_config_exists_and_declined(self):
+        config_path = os.path.join(self.home, ".config", "slurm-mailer", "config.ini")
+        os.makedirs(os.path.dirname(config_path))
+        with open(config_path, "w") as f:
+            f.write("original content")
+        responses = self.base_responses()
+        responses[-2] = config_path  # explicit config path
+        responses[-1] = "n"          # decline overwrite
+        rc = self._run(responses)
+        self.assertEqual(rc, 1)
+        with open(config_path) as f:
+            self.assertEqual(f.read(), "original content")
+
+    def test_skips_password_when_no_user(self):
+        def fail_getpass(prompt):
+            raise AssertionError("password should not be prompted")
+        responses = [
+            "smtp.example.com", "", "", "",   # host, tls, port, user (empty)
+            "from@example.com", "alice@example.com",
+            "n", "", "", "", "", "",
+        ]
+        rc = self._run(responses, getpass_fn=fail_getpass)
+        self.assertEqual(rc, 0)
+        config_path = os.path.join(self.home, ".config", "slurm-mailer", "config.ini")
+        c = parse_config(config_path)
+        self.assertEqual(c.email.smtp_user, "")
+        self.assertEqual(c.email.smtp_password, "")
+
+    def test_test_email_failure_then_skip(self):
+        responses = [
+            "smtp.example.com", "", "",
+            "mailer@example.com",
+            "from@example.com", "alice@example.com",
+            "y",   # send test email
+            "n",   # retry? no
+            "", "", "", "", "",
+        ]
+        rc = self._run(responses, smtp_class=FailingSMTP)
+        self.assertEqual(rc, 0)
+        self.assertIn("Test email failed", self.stdout.getvalue())
 
 
 if __name__ == "__main__":

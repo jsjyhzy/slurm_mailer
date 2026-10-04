@@ -42,3 +42,4 @@ result/
 
 src/slurm_mailer.egg-info/
 uv.lock
+config.ini
