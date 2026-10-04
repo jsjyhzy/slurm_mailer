@@ -1,0 +1,25 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.11-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: Astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          uv sync --dev
+
+      - name: Build wheel
+        run: uv build --wheel
